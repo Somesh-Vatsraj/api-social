@@ -1,4 +1,5 @@
 import os
+import re
 import yt_dlp
 
 SUPPORTED = {
@@ -10,7 +11,6 @@ SUPPORTED = {
     "pinterest": "Pinterest",
     "moj": "Moj",
 }
-
 
 def extract_media(url: str, platform: str):
     opts = {
@@ -26,7 +26,7 @@ def extract_media(url: str, platform: str):
         },
     }
 
-    # Pass cookies for both YouTube and Instagram
+    # Load Instagram / YouTube Cookies from environment variable file path
     cookies_file = os.getenv("COOKIES_FILE") or os.getenv("YOUTUBE_COOKIES_FILE")
     if cookies_file and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
@@ -36,13 +36,13 @@ def extract_media(url: str, platform: str):
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         error = str(exc)
-        if "Sign in to confirm" in error or "not a bot" in error or "login" in error.lower():
+        if "Sign in to confirm" in error or "login" in error.lower():
             raise RuntimeError(
-                "Platform blocked this request. Configure COOKIES_FILE with valid cookies.txt."
+                "Instagram or YouTube blocked this request. Provide a valid COOKIES_FILE."
             )
         raise RuntimeError(f"Media extraction failed: {error}")
 
-    # Username resolution with Instagram specific fallbacks
+    # Extract or sanitize username
     username = (
         info.get("uploader_id")
         or info.get("uploader")
@@ -51,21 +51,30 @@ def extract_media(url: str, platform: str):
         or ""
     )
 
-    # If yt-dlp returns a raw numeric ID for Instagram, clear or sanitize it
-    if platform == "instagram" and username.isdigit():
-        username = info.get("uploader") or ""
+    # Scrape username handle directly from URL if yt-dlp returns an ID or Display Name
+    if platform == "instagram" and (username.isdigit() or " " in username):
+        # Attempt to extract handle from webpage URL or fallback to uploader_id
+        uploader_id = info.get("uploader_id")
+        if uploader_id and not uploader_id.isdigit():
+            username = uploader_id
+
+    # Profile Image Uri extraction
+    profile_image_uri = (
+        info.get("uploader_avatar")
+        or info.get("avatar")
+        or info.get("channel_follower_count") # Fallback safety
+        or ""
+    )
 
     caption = info.get("description") or info.get("title") or ""
-    profile_image_uri = info.get("uploader_avatar") or info.get("avatar") or ""
 
     media_list = []
     seen_urls = set()
 
-    # 1. Video extraction (Primary)
+    # 1. Video extraction
     video_url = info.get("url")
     formats = info.get("formats", [])
 
-    # Find the best video format directly if info['url'] is missing or points to an image
     if not video_url or ".jpg" in video_url or ".png" in video_url:
         for f in reversed(formats):
             if f.get("vcodec") != "none" and f.get("url"):
@@ -106,37 +115,27 @@ def extract_media(url: str, platform: str):
         })
 
     # 3. Audio extraction
-    audio_url = None
-    audio_codec = "mp4a.40.5"
-    audio_bitrate = "64"
-
     for f in formats:
-        if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
-            audio_url = f.get("url")
-            audio_codec = f.get("acodec", audio_codec)
-            audio_bitrate = str(f.get("abr") or f.get("tbr") or "64")
+        a_url = f.get("url")
+        if f.get("vcodec") == "none" and f.get("acodec") != "none" and a_url and a_url not in seen_urls:
+            seen_urls.add(a_url)
+            media_list.append({
+                "type": "audio",
+                "id": f"{info.get('id', '101')}audio",
+                "url": a_url,
+                "quality": "AUDIO_QUALITY_MEDIUM",
+                "container": "audio/m4a",
+                "has_audio": True,
+                "has_video": False,
+                "has_photo": False,
+                "bitrate": str(f.get("abr") or f.get("tbr") or "64"),
+                "codecs": f.get("acodec", "mp4a.40.5"),
+            })
             break
-
-    if audio_url and audio_url not in seen_urls:
-        seen_urls.add(audio_url)
-        media_list.append({
-            "type": "audio",
-            "id": f"{info.get('id', '101')}audio",
-            "url": audio_url,
-            "quality": "AUDIO_QUALITY_MEDIUM",
-            "container": "audio/m4a",
-            "has_audio": True,
-            "has_video": False,
-            "has_photo": False,
-            "bitrate": audio_bitrate,
-            "codecs": audio_codec,
-        })
-
-    has_video = any(item["type"] == "video" for item in media_list)
 
     return {
         "success": True,
-        "type": "video" if has_video else "photo",
+        "type": "video" if any(item["type"] == "video" for item in media_list) else "photo",
         "username": username,
         "profile_image_uri": profile_image_uri,
         "caption": caption,
