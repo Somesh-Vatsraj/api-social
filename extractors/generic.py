@@ -1,5 +1,6 @@
 import os
 import re
+import urllib.request
 import yt_dlp
 
 SUPPORTED = {
@@ -12,6 +13,53 @@ SUPPORTED = {
     "moj": "Moj",
 }
 
+
+def get_instagram_meta(url: str):
+    """Fallback scraper to get exact handle and profile image from public Instagram metadata."""
+    username = ""
+    profile_image = ""
+
+    try:
+        # Extract username handle directly from URL path (e.g. instagram.com/username/reel/...)
+        match = re.search(r"instagram\.com/([^/?#&]+)", url)
+        if match and match.group(1) not in ["reel", "p", "reels", "tv", "stories"]:
+            username = match.group(1)
+
+        # Request page HTML to grab profile image / user meta tags
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode("utf-8")
+
+            # Extract profile pic from JSON payload or OpenGraph meta tags
+            img_match = (
+                re.search(r'"profile_pic_url":"([^"]+)"', html)
+                or re.search(r'"profile_pic_url_hd":"([^"]+)"', html)
+                or re.search(r'property="og:image"\s+content="([^"]+)"', html)
+            )
+            if img_match:
+                profile_image = img_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+
+            # Fallback for username if URL didn't contain it
+            if not username:
+                user_match = re.search(r'"owner":\s*{\s*"username":\s*"([^"]+)"', html)
+                if user_match:
+                    username = user_match.group(1)
+
+    except Exception:
+        pass
+
+    return username, profile_image
+
+
 def extract_media(url: str, platform: str):
     opts = {
         "quiet": True,
@@ -21,12 +69,16 @@ def extract_media(url: str, platform: str):
         "extract_flat": False,
         "format": "bestvideo+bestaudio/best",
         "extractor_args": {
-            "youtube": {"player_client": ["web", "android"]},
-            "instagram": {"get_comments": False},
+            "youtube": {
+                "player_client": ["web", "android"],
+            },
+            "instagram": {
+                "get_comments": False,
+            },
         },
     }
 
-    # Load Instagram / YouTube Cookies from environment variable file path
+    # Load Cookies file if available (Render / Server environment variable)
     cookies_file = os.getenv("COOKIES_FILE") or os.getenv("YOUTUBE_COOKIES_FILE")
     if cookies_file and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
@@ -36,13 +88,13 @@ def extract_media(url: str, platform: str):
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         error = str(exc)
-        if "Sign in to confirm" in error or "login" in error.lower():
+        if "Sign in to confirm" in error or "not a bot" in error or "login" in error.lower():
             raise RuntimeError(
-                "Instagram or YouTube blocked this request. Provide a valid COOKIES_FILE."
+                "Platform blocked this request. Configure COOKIES_FILE with a valid cookies.txt."
             )
         raise RuntimeError(f"Media extraction failed: {error}")
 
-    # Extract or sanitize username
+    # Initial extraction from yt-dlp
     username = (
         info.get("uploader_id")
         or info.get("uploader")
@@ -50,28 +102,27 @@ def extract_media(url: str, platform: str):
         or info.get("user")
         or ""
     )
-
-    # Scrape username handle directly from URL if yt-dlp returns an ID or Display Name
-    if platform == "instagram" and (username.isdigit() or " " in username):
-        # Attempt to extract handle from webpage URL or fallback to uploader_id
-        uploader_id = info.get("uploader_id")
-        if uploader_id and not uploader_id.isdigit():
-            username = uploader_id
-
-    # Profile Image Uri extraction
-    profile_image_uri = (
-        info.get("uploader_avatar")
-        or info.get("avatar")
-        or info.get("channel_follower_count") # Fallback safety
-        or ""
-    )
-
+    profile_image_uri = info.get("uploader_avatar") or info.get("avatar") or ""
     caption = info.get("description") or info.get("title") or ""
+
+    # Fix: If username is a raw numeric ID, display name, or profile picture is missing (Instagram specific)
+    if platform == "instagram" and (
+        not profile_image_uri or username.isdigit() or " " in username
+    ):
+        scraped_user, scraped_avatar = get_instagram_meta(url)
+
+        if scraped_user:
+            username = scraped_user
+        elif username.isdigit() or " " in username:
+            username = info.get("uploader_id") or ""
+
+        if scraped_avatar:
+            profile_image_uri = scraped_avatar
 
     media_list = []
     seen_urls = set()
 
-    # 1. Video extraction
+    # 1. Primary Video extraction
     video_url = info.get("url")
     formats = info.get("formats", [])
 
@@ -99,7 +150,7 @@ def extract_media(url: str, platform: str):
             "bitrate": info.get("tbr"),
         })
 
-    # 2. Thumbnail / Photo extraction
+    # 2. Thumbnail / Cover Photo extraction
     thumbnail = info.get("thumbnail")
     if thumbnail and thumbnail not in seen_urls:
         seen_urls.add(thumbnail)
@@ -133,9 +184,11 @@ def extract_media(url: str, platform: str):
             })
             break
 
+    has_video = any(item["type"] == "video" for item in media_list)
+
     return {
         "success": True,
-        "type": "video" if any(item["type"] == "video" for item in media_list) else "photo",
+        "type": "video" if has_video else "photo",
         "username": username,
         "profile_image_uri": profile_image_uri,
         "caption": caption,
