@@ -16,54 +16,77 @@ SUPPORTED = {
 }
 
 
-def get_instagram_details(url: str):
-    """Fetches exact username handle and profile_image_uri via Instagram's public API."""
+def fetch_instagram_profile_info(url: str):
+    """
+    Directly fetches exact handle (@username) and profile picture URL 
+    using Instagram's public embed endpoint.
+    """
     username = ""
     profile_image = ""
 
-    # Extract shortcode from Instagram URL (e.g., /p/C123abc/ or /reel/C123abc/)
+    # Extract Instagram post/reel shortcode from URL
     match = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)", url)
     if not match:
         return username, profile_image
 
     shortcode = match.group(1)
 
+    # 1. Primary Attempt: Use Instagram Embed Info Endpoint (Bypasses IP restrictions)
+    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
     try:
-        # Instagram GraphQL Public Endpoint
-        graphql_url = (
-            f"https://www.instagram.com/graphql/query/?doc_id=8833684803378311&variables="
-            + urllib.parse.quote(json.dumps({"shortcode": shortcode}))
-        )
-
         req = urllib.request.Request(
-            graphql_url,
+            embed_url,
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "X-IG-App-ID": "936619743392459",  # Public Instagram Web App ID
-                "Sec-Fetch-Mode": "cors",
+                )
             },
         )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            html = response.read().decode("utf-8")
 
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            media_data = data.get("data", {}).get("xdt_shortcode_media", {})
-            owner = media_data.get("owner", {})
+            # Extract handle (@username)
+            user_match = re.search(r'class="UsernameText"[^>]*>([^<]+)</div>', html) or \
+                         re.search(r'"username":"([^"]+)"', html)
+            if user_match:
+                username = user_match.group(1).strip()
 
-            username = owner.get("username", "")
-            profile_image = owner.get("profile_pic_url", "")
+            # Extract avatar image URI
+            avatar_match = re.search(r'class="Avatar"[^>]*src="([^"]+)"', html) or \
+                           re.search(r'"profile_pic_url":"([^"]+)"', html) or \
+                           re.search(r'class="Square--avatar"[^>]*src="([^"]+)"', html)
+            if avatar_match:
+                profile_image = avatar_match.group(1).replace("&amp;", "&").replace("\\/", "/")
 
     except Exception:
         pass
 
-    # Fallback: Extract handle directly from URL path if API is rate-limited
-    if not username:
-        url_user = re.search(r"instagram\.com/([^/?#&]+)", url)
-        if url_user and url_user.group(1) not in ["reel", "p", "reels", "tv", "stories"]:
-            username = url_user.group(1)
+    # 2. Secondary Fallback: GraphQL endpoint if embed scraper is empty
+    if not username or not profile_image:
+        try:
+            gql_url = (
+                f"https://www.instagram.com/graphql/query/?doc_id=8833684803378311&variables="
+                + urllib.parse.quote(json.dumps({"shortcode": shortcode}))
+            )
+            req = urllib.request.Request(
+                gql_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "X-IG-App-ID": "936619743392459",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                owner = data.get("data", {}).get("xdt_shortcode_media", {}).get("owner", {})
+                
+                if not username:
+                    username = owner.get("username", "")
+                if not profile_image:
+                    profile_image = owner.get("profile_pic_url", "")
+        except Exception:
+            pass
 
     return username, profile_image
 
@@ -104,15 +127,17 @@ def extract_media(url: str, platform: str):
     profile_image_uri = info.get("uploader_avatar") or ""
     caption = info.get("description") or info.get("title") or ""
 
-    # Instagram Profile Fix: Query Instagram API if values are missing or numeric
-    if platform == "instagram" and (
-        not profile_image_uri or username.isdigit() or " " in username
-    ):
-        api_username, api_avatar = get_instagram_details(url)
-        if api_username:
-            username = api_username
-        if api_avatar:
-            profile_image_uri = api_avatar
+    # FIX: Override Instagram profile metadata if numerical or empty
+    if platform == "instagram":
+        real_username, real_avatar = fetch_instagram_profile_info(url)
+        
+        if real_username:
+            username = real_username
+        elif username.isdigit() or " " in username:
+            username = info.get("uploader_id") or ""
+
+        if real_avatar:
+            profile_image_uri = real_avatar
 
     media_list = []
     seen_urls = set()
@@ -160,7 +185,7 @@ def extract_media(url: str, platform: str):
             "has_photo": True,
         })
 
-    # 3. Separate Audio Track
+    # 3. Audio Track
     for f in formats:
         a_url = f.get("url")
         if f.get("vcodec") == "none" and f.get("acodec") != "none" and a_url and a_url not in seen_urls:
