@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import urllib.parse
 import urllib.request
 import yt_dlp
 
@@ -14,48 +16,54 @@ SUPPORTED = {
 }
 
 
-def get_instagram_meta(url: str):
-    """Fallback scraper to get exact handle and profile image from public Instagram metadata."""
+def get_instagram_details(url: str):
+    """Fetches exact username handle and profile_image_uri via Instagram's public API."""
     username = ""
     profile_image = ""
 
-    try:
-        # Extract username handle directly from URL path (e.g. instagram.com/username/reel/...)
-        match = re.search(r"instagram\.com/([^/?#&]+)", url)
-        if match and match.group(1) not in ["reel", "p", "reels", "tv", "stories"]:
-            username = match.group(1)
+    # Extract shortcode from Instagram URL (e.g., /p/C123abc/ or /reel/C123abc/)
+    match = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)", url)
+    if not match:
+        return username, profile_image
 
-        # Request page HTML to grab profile image / user meta tags
+    shortcode = match.group(1)
+
+    try:
+        # Instagram GraphQL Public Endpoint
+        graphql_url = (
+            f"https://www.instagram.com/graphql/query/?doc_id=8833684803378311&variables="
+            + urllib.parse.quote(json.dumps({"shortcode": shortcode}))
+        )
+
         req = urllib.request.Request(
-            url,
+            graphql_url,
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "X-IG-App-ID": "936619743392459",  # Public Instagram Web App ID
+                "Sec-Fetch-Mode": "cors",
             },
         )
-        with urllib.request.urlopen(req, timeout=5) as response:
-            html = response.read().decode("utf-8")
 
-            # Extract profile pic from JSON payload or OpenGraph meta tags
-            img_match = (
-                re.search(r'"profile_pic_url":"([^"]+)"', html)
-                or re.search(r'"profile_pic_url_hd":"([^"]+)"', html)
-                or re.search(r'property="og:image"\s+content="([^"]+)"', html)
-            )
-            if img_match:
-                profile_image = img_match.group(1).replace("\\u0026", "&").replace("\\/", "/")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            media_data = data.get("data", {}).get("xdt_shortcode_media", {})
+            owner = media_data.get("owner", {})
 
-            # Fallback for username if URL didn't contain it
-            if not username:
-                user_match = re.search(r'"owner":\s*{\s*"username":\s*"([^"]+)"', html)
-                if user_match:
-                    username = user_match.group(1)
+            username = owner.get("username", "")
+            profile_image = owner.get("profile_pic_url", "")
 
     except Exception:
         pass
+
+    # Fallback: Extract handle directly from URL path if API is rate-limited
+    if not username:
+        url_user = re.search(r"instagram\.com/([^/?#&]+)", url)
+        if url_user and url_user.group(1) not in ["reel", "p", "reels", "tv", "stories"]:
+            username = url_user.group(1)
 
     return username, profile_image
 
@@ -69,16 +77,11 @@ def extract_media(url: str, platform: str):
         "extract_flat": False,
         "format": "bestvideo+bestaudio/best",
         "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "android"],
-            },
-            "instagram": {
-                "get_comments": False,
-            },
+            "youtube": {"player_client": ["web", "android"]},
+            "instagram": {"get_comments": False},
         },
     }
 
-    # Load Cookies file if available (Render / Server environment variable)
     cookies_file = os.getenv("COOKIES_FILE") or os.getenv("YOUTUBE_COOKIES_FILE")
     if cookies_file and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
@@ -88,41 +91,33 @@ def extract_media(url: str, platform: str):
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         error = str(exc)
-        if "Sign in to confirm" in error or "not a bot" in error or "login" in error.lower():
-            raise RuntimeError(
-                "Platform blocked this request. Configure COOKIES_FILE with a valid cookies.txt."
-            )
+        if "Sign in to confirm" in error or "login" in error.lower():
+            raise RuntimeError("Platform blocked request. Configure COOKIES_FILE.")
         raise RuntimeError(f"Media extraction failed: {error}")
 
-    # Initial extraction from yt-dlp
     username = (
         info.get("uploader_id")
         or info.get("uploader")
         or info.get("channel")
-        or info.get("user")
         or ""
     )
-    profile_image_uri = info.get("uploader_avatar") or info.get("avatar") or ""
+    profile_image_uri = info.get("uploader_avatar") or ""
     caption = info.get("description") or info.get("title") or ""
 
-    # Fix: If username is a raw numeric ID, display name, or profile picture is missing (Instagram specific)
+    # Instagram Profile Fix: Query Instagram API if values are missing or numeric
     if platform == "instagram" and (
         not profile_image_uri or username.isdigit() or " " in username
     ):
-        scraped_user, scraped_avatar = get_instagram_meta(url)
-
-        if scraped_user:
-            username = scraped_user
-        elif username.isdigit() or " " in username:
-            username = info.get("uploader_id") or ""
-
-        if scraped_avatar:
-            profile_image_uri = scraped_avatar
+        api_username, api_avatar = get_instagram_details(url)
+        if api_username:
+            username = api_username
+        if api_avatar:
+            profile_image_uri = api_avatar
 
     media_list = []
     seen_urls = set()
 
-    # 1. Primary Video extraction
+    # 1. Primary Video
     video_url = info.get("url")
     formats = info.get("formats", [])
 
@@ -150,7 +145,7 @@ def extract_media(url: str, platform: str):
             "bitrate": info.get("tbr"),
         })
 
-    # 2. Thumbnail / Cover Photo extraction
+    # 2. Cover Photo / Thumbnail
     thumbnail = info.get("thumbnail")
     if thumbnail and thumbnail not in seen_urls:
         seen_urls.add(thumbnail)
@@ -165,7 +160,7 @@ def extract_media(url: str, platform: str):
             "has_photo": True,
         })
 
-    # 3. Audio extraction
+    # 3. Separate Audio Track
     for f in formats:
         a_url = f.get("url")
         if f.get("vcodec") == "none" and f.get("acodec") != "none" and a_url and a_url not in seen_urls:
@@ -184,11 +179,9 @@ def extract_media(url: str, platform: str):
             })
             break
 
-    has_video = any(item["type"] == "video" for item in media_list)
-
     return {
         "success": True,
-        "type": "video" if has_video else "photo",
+        "type": "video" if any(i["type"] == "video" for i in media_list) else "photo",
         "username": username,
         "profile_image_uri": profile_image_uri,
         "caption": caption,
