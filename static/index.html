@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Social Downloader</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="container">
+    <section class="hero">
+      <div class="badge">Social Downloader</div>
+      <h1>Download public media</h1>
+      <p>Video, audio and available images from supported public URLs.</p>
+      <form id="form">
+        <input id="url" type="url" required placeholder="Paste Instagram, Facebook, TikTok, YouTube URL...">
+        <button>Extract</button>
+      </form>
+      <p class="notice">Use only content you own or have permission to download.</p>
+    </section>
+    <section id="result" class="result hidden"></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
