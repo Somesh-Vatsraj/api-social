@@ -5,67 +5,51 @@ import urllib.parse
 import urllib.request
 import yt_dlp
 
+# Fallback Official Logos for platforms when user avatar is blocked
+PLATFORM_LOGOS = {
+    "instagram": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Instagram_logo_2016.svg/2048px-Instagram_logo_2016.svg.png",
+    "facebook": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Facebook_Logo_%282019%29.png/1024px-Facebook_Logo_%282019%29.png",
+    "youtube": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/09/YouTube_full-color_icon_%282017%29.svg/1024px-YouTube_full-color_icon_%282017%29.svg.png",
+    "tiktok": "https://upload.wikimedia.org/wikipedia/en/thumb/a/a9/TikTok_logo.svg/1024px-TikTok_logo.svg.png",
+    "threads": "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9d/Threads_%28app%29_logo.svg/1024px-Threads_%28app%29_logo.svg.png",
+    "pinterest": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Pinterest-logo.org.svg/1024px-Pinterest-logo.org.svg.png",
+}
 
-def get_instagram_profile_avatar(url: str, fallback_username: str = ""):
-    """
-    Guaranteed resolution for Instagram profile avatar.
-    Uses OEmbed API + OpenGraph Meta Tag Scraper.
-    """
-    profile_image_uri = ""
-
-    # Clean shortcode
+def get_instagram_profile_avatar(url: str):
+    """Fetches and cleans Instagram avatar link."""
     match = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)", url)
     if not match:
-        return profile_image_uri
+        return ""
 
     shortcode = match.group(1)
     
-    # 1. Primary Strategy: Instagram Public OEmbed API
-    oembed_url = f"https://api.instagram.com/oembed/?url=https://www.instagram.com/p/{shortcode}/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
-
+    # Try OEmbed API
     try:
-        req = urllib.request.Request(oembed_url, headers=headers)
+        oembed_url = f"https://api.instagram.com/oembed/?url=https://www.instagram.com/p/{shortcode}/"
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            # Extracts author avatar thumbnail if present
-            profile_image_uri = data.get("thumbnail_url", "")
+            if data.get("thumbnail_url"):
+                return data["thumbnail_url"]
     except Exception:
         pass
 
-    # 2. Secondary Strategy: HTML Embed Meta/Script Deep Scraper
-    if not profile_image_uri or ".jpg" not in profile_image_uri:
+    # Fallback to Embed HTML parsing
+    try:
         embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-        try:
-            req = urllib.request.Request(embed_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                html = resp.read().decode("utf-8")
+        req = urllib.request.Request(embed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            html = resp.read().decode("utf-8")
+            m = (
+                re.search(r'"profile_pic_url":"([^"]+)"', html) or
+                re.search(r'class="Avatar"[^>]*src="([^"]+)"', html)
+            )
+            if m and m.group(1):
+                return m.group(1).replace("\\/", "/").replace("\\u0026", "&").replace("&amp;", "&")
+    except Exception:
+        pass
 
-                # Search across all possible avatar JSON representations
-                avatar_matches = [
-                    re.search(r'"profile_pic_url":"([^"]+)"', html),
-                    re.search(r'class="Avatar"[^>]*src="([^"]+)"', html),
-                    re.search(r'class="Square--avatar"[^>]*src="([^"]+)"', html),
-                    re.search(r'hd_profile_pic_url_info":\s*\{\s*"url":\s*"([^"]+)"', html),
-                    re.search(r'"owner":\{"id":"[^"]+","profile_pic_url":"([^"]+)"', html)
-                ]
-
-                for m in avatar_matches:
-                    if m and m.group(1):
-                        raw_uri = m.group(1)
-                        # Sanitize Instagram escaped JSON parameters
-                        profile_image_uri = (
-                            raw_uri.replace("\\/", "/")
-                            .replace("\\u0026", "&")
-                            .replace("&amp;", "&")
-                        )
-                        break
-        except Exception:
-            pass
-
-    return profile_image_uri
+    return ""
 
 
 def extract_media(url: str, platform: str):
@@ -79,6 +63,7 @@ def extract_media(url: str, platform: str):
         "extractor_args": {
             "youtube": {"player_client": ["web", "android"]},
             "instagram": {"get_comments": False},
+            "facebook": {"get_comments": False},
         },
     }
 
@@ -101,19 +86,24 @@ def extract_media(url: str, platform: str):
     profile_image_uri = info.get("uploader_avatar") or ""
     caption = info.get("description") or info.get("title") or ""
 
-    # Fix Instagram Profile Picture Extraction
+    # Instagram Profile Avatar Attempt
     if platform == "instagram":
-        avatar_fallback = get_instagram_profile_avatar(url)
-        if avatar_fallback:
-            profile_image_uri = avatar_fallback
+        avatar = get_instagram_profile_avatar(url)
+        if avatar:
+            profile_image_uri = avatar
 
     # Fix numeric username fallback
     if username.isdigit() and info.get("uploader"):
         username = info.get("uploader")
 
+    # FIX 1: Platform Logo Fallback if avatar is empty/blocked
+    if not profile_image_uri or profile_image_uri.strip() == "":
+        profile_image_uri = PLATFORM_LOGOS.get(platform.lower(), "")
+
     media_list = []
     seen_urls = set()
 
+    # 1. Main Video Format
     video_url = info.get("url")
     formats = info.get("formats", [])
 
@@ -141,6 +131,7 @@ def extract_media(url: str, platform: str):
             "bitrate": info.get("tbr"),
         })
 
+    # 2. Cover / Thumbnail Photo
     thumbnail = info.get("thumbnail")
     if thumbnail and thumbnail not in seen_urls:
         seen_urls.add(thumbnail)
@@ -154,6 +145,28 @@ def extract_media(url: str, platform: str):
             "has_video": False,
             "has_photo": True,
         })
+
+    # FIX 2: Audio Stream Extraction (Robust for Facebook, Instagram & YouTube)
+    for f in formats:
+        a_url = f.get("url")
+        # Matches audio-only formats or Facebook DASH audio tracks
+        is_audio_only = (f.get("vcodec") == "none" or f.get("vcodec") is None) and f.get("acodec") not in (None, "none")
+        
+        if is_audio_only and a_url and a_url not in seen_urls:
+            seen_urls.add(a_url)
+            media_list.append({
+                "type": "audio",
+                "id": f"{info.get('id', '101')}audio",
+                "url": a_url,
+                "quality": "AUDIO_QUALITY_MEDIUM",
+                "container": f"audio/{f.get('ext', 'm4a')}",
+                "has_audio": True,
+                "has_video": False,
+                "has_photo": False,
+                "bitrate": str(f.get("abr") or f.get("tbr") or "128"),
+                "codecs": f.get("acodec", "mp4a.40.2"),
+            })
+            break  # Direct best audio added
 
     return {
         "success": True,
