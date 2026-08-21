@@ -5,7 +5,7 @@ import urllib.parse
 import urllib.request
 import yt_dlp
 
-# Fallback Official Logos for platforms when user avatar is blocked
+# Platform logos used when user avatar is blocked or unavailable
 PLATFORM_LOGOS = {
     "instagram": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Instagram_logo_2016.svg/2048px-Instagram_logo_2016.svg.png",
     "facebook": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Facebook_Logo_%282019%29.png/1024px-Facebook_Logo_%282019%29.png",
@@ -22,11 +22,12 @@ def get_instagram_profile_avatar(url: str):
         return ""
 
     shortcode = match.group(1)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # Try OEmbed API
+    # Strategy 1: OEmbed API
     try:
         oembed_url = f"https://api.instagram.com/oembed/?url=https://www.instagram.com/p/{shortcode}/"
-        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(oembed_url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if data.get("thumbnail_url"):
@@ -34,10 +35,10 @@ def get_instagram_profile_avatar(url: str):
     except Exception:
         pass
 
-    # Fallback to Embed HTML parsing
+    # Strategy 2: Embed HTML regex parsing
     try:
         embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
-        req = urllib.request.Request(embed_url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(embed_url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as resp:
             html = resp.read().decode("utf-8")
             m = (
@@ -67,7 +68,12 @@ def extract_media(url: str, platform: str):
         },
     }
 
-    cookies_file = os.getenv("COOKIES_FILE") or os.getenv("YOUTUBE_COOKIES_FILE")
+    # Checks environment variables OR looks directly for 'cookies.txt' in project folder
+    cookies_file = (
+        os.getenv("COOKIES_FILE") 
+        or os.getenv("YOUTUBE_COOKIES_FILE") 
+        or "cookies.txt"
+    )
     if cookies_file and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
 
@@ -86,8 +92,8 @@ def extract_media(url: str, platform: str):
     profile_image_uri = info.get("uploader_avatar") or ""
     caption = info.get("description") or info.get("title") or ""
 
-    # Instagram Profile Avatar Attempt
-    if platform == "instagram":
+    # Fetch avatar directly for Instagram
+    if platform.lower() == "instagram":
         avatar = get_instagram_profile_avatar(url)
         if avatar:
             profile_image_uri = avatar
@@ -96,7 +102,7 @@ def extract_media(url: str, platform: str):
     if username.isdigit() and info.get("uploader"):
         username = info.get("uploader")
 
-    # FIX 1: Platform Logo Fallback if avatar is empty/blocked
+    # Set platform logo if profile avatar is missing/empty
     if not profile_image_uri or profile_image_uri.strip() == "":
         profile_image_uri = PLATFORM_LOGOS.get(platform.lower(), "")
 
@@ -146,10 +152,9 @@ def extract_media(url: str, platform: str):
             "has_photo": True,
         })
 
-    # FIX 2: Audio Stream Extraction (Robust for Facebook, Instagram & YouTube)
+    # 3. Audio Stream Extraction (Handles Facebook, Instagram & YouTube DASH)
     for f in formats:
         a_url = f.get("url")
-        # Matches audio-only formats or Facebook DASH audio tracks
         is_audio_only = (f.get("vcodec") == "none" or f.get("vcodec") is None) and f.get("acodec") not in (None, "none")
         
         if is_audio_only and a_url and a_url not in seen_urls:
@@ -166,7 +171,7 @@ def extract_media(url: str, platform: str):
                 "bitrate": str(f.get("abr") or f.get("tbr") or "128"),
                 "codecs": f.get("acodec", "mp4a.40.2"),
             })
-            break  # Direct best audio added
+            break
 
     return {
         "success": True,
