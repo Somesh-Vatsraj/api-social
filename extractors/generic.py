@@ -1,3 +1,4 @@
+import os
 import yt_dlp
 
 SUPPORTED = {
@@ -10,19 +11,48 @@ SUPPORTED = {
     "moj": "Moj",
 }
 
+
 def extract_media(url: str, platform: str):
-    # yt-dlp supports many public media URLs. Platform-specific adapters
-    # can be added later when a provider requires custom handling.
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
+
+        # Prefer formats that can be directly played/downloaded.
+        "format": "bestvideo+bestaudio/best",
+
+        # Avoid unnecessary playlist/channel extraction.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android"],
+            }
+        },
     }
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    # Optional YouTube cookies.
+    # Set YOUTUBE_COOKIES_FILE in Render environment variables
+    # to the path of a valid cookies.txt file.
+    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE")
+
+    if platform == "youtube" and cookies_file:
+        if os.path.isfile(cookies_file):
+            opts["cookiefile"] = cookies_file
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        error = str(exc)
+
+        if "Sign in to confirm" in error or "not a bot" in error:
+            raise RuntimeError(
+                "YouTube is blocking this server request. "
+                "Configure YOUTUBE_COOKIES_FILE with a valid cookies.txt file."
+            )
+
+        raise RuntimeError(f"Media extraction failed: {error}")
 
     videos = []
     audio = None
@@ -30,6 +60,7 @@ def extract_media(url: str, platform: str):
 
     for f in info.get("formats", []):
         direct = f.get("url")
+
         if not direct:
             continue
 
@@ -38,30 +69,44 @@ def extract_media(url: str, platform: str):
         acodec = f.get("acodec")
         vcodec = f.get("vcodec")
 
+        # Video formats
         if vcodec and vcodec != "none":
             quality = f"{height}p" if height else "video"
+
             videos.append({
                 "quality": quality,
                 "ext": ext or "mp4",
-                "download_url": direct
+                "download_url": direct,
             })
 
-        if acodec and acodec != "none" and (not vcodec or vcodec == "none"):
+        # Audio-only formats
+        if (
+            acodec
+            and acodec != "none"
+            and (not vcodec or vcodec == "none")
+        ):
             if audio is None:
                 audio = {
                     "ext": ext or "m4a",
-                    "download_url": direct
+                    "download_url": direct,
                 }
 
     thumbnail = info.get("thumbnail")
+
     if thumbnail:
         images.append(thumbnail)
 
-    # Remove duplicate video entries by quality/ext/url.
+    # Remove duplicates
     unique = []
     seen = set()
+
     for item in videos:
-        key = (item["quality"], item["ext"], item["download_url"])
+        key = (
+            item["quality"],
+            item["ext"],
+            item["download_url"],
+        )
+
         if key not in seen:
             seen.add(key)
             unique.append(item)
@@ -73,6 +118,6 @@ def extract_media(url: str, platform: str):
         "media": {
             "videos": unique,
             "audio": audio,
-            "images": images
-        }
+            "images": images,
+        },
     }
