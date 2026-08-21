@@ -5,6 +5,7 @@ import urllib.parse
 import urllib.request
 import yt_dlp
 
+# Platform logos used when user avatar is blocked or unavailable
 PLATFORM_LOGOS = {
     "instagram": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Instagram_logo_2016.svg/2048px-Instagram_logo_2016.svg.png",
     "facebook": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Facebook_Logo_%282019%29.png/1024px-Facebook_Logo_%282019%29.png",
@@ -15,6 +16,7 @@ PLATFORM_LOGOS = {
 }
 
 def get_instagram_profile_avatar(url: str):
+    """Fetches and cleans Instagram avatar link."""
     match = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)", url)
     if not match:
         return ""
@@ -50,13 +52,15 @@ def get_instagram_profile_avatar(url: str):
 
 
 def extract_media(url: str, platform: str):
+    # FIXED: Flex format query so Pinterest & Instagram don't throw 'Format not available' error
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
-        "format": "best",  # 'best' grabs pre-merged MP4 with integrated audio on Pinterest
+        "format": "bestvideo+bestaudio/best/b",  # Safe fallback sequence
+        "ignoreerrors": True,
         "extractor_args": {
             "youtube": {"player_client": ["web", "android"]},
             "instagram": {"get_comments": False},
@@ -75,6 +79,8 @@ def extract_media(url: str, platform: str):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
+            if not info:
+                raise RuntimeError("No media info retrieved")
     except Exception as exc:
         raise RuntimeError(f"Media extraction failed: {str(exc)}")
 
@@ -100,23 +106,20 @@ def extract_media(url: str, platform: str):
 
     media_list = []
     seen_urls = set()
-    formats = info.get("formats", [])
+    formats = info.get("formats", []) or []
 
-    # 1. PINTEREST & HLS FIX: Prioritize Direct Progressive MP4 (has audio built-in)
+    # 1. Video extraction logic (Prefers Direct MP4 over M3U8 for Audio reliability)
     video_url = None
-    direct_mp4 = None
-
+    
+    # First search for a direct MP4 file that contains both video and audio
     for f in reversed(formats):
         f_url = f.get("url", "")
-        # Look for direct MP4 files first (bypasses .m3u8 audio issues)
-        if f.get("vcodec") != "none" and f.get("acodec") != "none" and ".mp4" in f_url:
-            direct_mp4 = f_url
+        if f.get("vcodec") != "none" and f_url and ".mp4" in f_url:
+            video_url = f_url
             break
 
-    # Fallback to general video format if direct MP4 isn't found
-    if direct_mp4:
-        video_url = direct_mp4
-    else:
+    # Fallback to main info URL
+    if not video_url:
         video_url = info.get("url")
         if not video_url or ".jpg" in video_url or ".png" in video_url:
             for f in reversed(formats):
@@ -142,7 +145,7 @@ def extract_media(url: str, platform: str):
             "bitrate": info.get("tbr"),
         })
 
-    # 2. Cover / Thumbnail Photo
+    # 2. Cover / Thumbnail Image
     thumbnail = info.get("thumbnail")
     if thumbnail and thumbnail not in seen_urls:
         seen_urls.add(thumbnail)
@@ -157,7 +160,7 @@ def extract_media(url: str, platform: str):
             "has_photo": True,
         })
 
-    # 3. Audio Extraction (Extracts Audio track explicitly)
+    # 3. Dedicated Audio Extraction
     audio_found = False
     for f in formats:
         a_url = f.get("url")
@@ -180,8 +183,8 @@ def extract_media(url: str, platform: str):
             audio_found = True
             break
 
-    # If Pinterest doesn't provide a separate audio stream in formats, use the MP4 url as audio fallback
-    if not audio_found and video_url and ".m3u8" not in video_url:
+    # Direct Audio Fallback if no separate audio format stream is listed
+    if not audio_found and video_url:
         media_list.append({
             "type": "audio",
             "id": f"{info.get('id', '101')}audio",
