@@ -43,81 +43,91 @@ def extract_media(url: str, platform: str):
             )
         raise RuntimeError(f"Media extraction failed: {error}")
 
+    # Fallbacks for username/channel name
+    username = (
+        info.get("uploader_id")
+        or info.get("uploader")
+        or info.get("channel")
+        or ""
+    )
+
+    # Caption extraction
+    caption = info.get("description") or info.get("title") or ""
+
+    # Profile Image fallback (yt-dlp rarely provides user avatars, uses thumbnail if unavailable)
+    profile_image_uri = info.get("uploader_avatar") or ""
+
     media_list = []
     seen_urls = set()
 
-    # 1. Process Thumbnail (Photo)
+    # 1. Process Thumbnail as "photo"
     thumbnail = info.get("thumbnail")
     if thumbnail and thumbnail not in seen_urls:
         seen_urls.add(thumbnail)
         media_list.append({
             "type": "photo",
-            "id": f"photo_{info.get('id', '1')}",
+            "id": f"POLARIS_{info.get('id', '100')}",
             "url": thumbnail,
-            "width": info.get("width"),
-            "height": info.get("height"),
+            "width": info.get("width") or 640,
+            "height": info.get("height") or 1136,
             "has_audio": False,
             "has_video": False,
             "has_photo": True
         })
 
-    # 2. Process Video and Audio Formats
-    for f in info.get("formats", []):
-        direct = f.get("url")
-        if not direct or direct in seen_urls:
-            continue
+    # 2. Extract best combined Video and Audio sources
+    best_video_url = info.get("url")
+    if best_video_url and best_video_url not in seen_urls:
+        seen_urls.add(best_video_url)
+        
+        height = info.get("height")
+        quality_str = f"{height}p" if height else "1080p"
 
-        acodec = f.get("acodec")
-        vcodec = f.get("vcodec")
-        height = f.get("height")
-        width = f.get("width")
-        ext = f.get("ext", "mp4")
+        media_list.append({
+            "type": "video",
+            "id": str(info.get("id", "101")),
+            "url": best_video_url,
+            "quality": quality_str,
+            "container": f"video/{info.get('ext', 'mp4')}",
+            "has_audio": True,
+            "has_video": True,
+            "has_photo": False,
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "fps": info.get("fps"),
+            "bitrate": info.get("tbr")
+        })
 
-        is_video = vcodec and vcodec != "none"
-        is_audio = acodec and acodec != "none"
+    # 3. Separate Audio item
+    requested_formats = info.get("requested_formats") or []
+    audio_format = None
 
-        # Video Entry
-        if is_video:
-            seen_urls.add(direct)
-            media_list.append({
-                "type": "video",
-                "id": str(f.get("format_id", "101")),
-                "url": direct,
-                "quality": f"{height}p" if height else "default",
-                "container": f"video/{ext}",
-                "has_audio": is_audio,
-                "has_video": True,
-                "has_photo": False,
-                "width": width,
-                "height": height,
-                "fps": f.get("fps"),
-                "bitrate": f.get("tbr")
-            })
+    for f in requested_formats:
+        if f.get("vcodec") == "none" and f.get("acodec") != "none":
+            audio_format = f
+            break
 
-        # Separate Audio-only Entry
-        elif is_audio and not is_video:
-            seen_urls.add(direct)
-            media_list.append({
-                "type": "audio",
-                "id": str(f.get("format_id", "audio_1")),
-                "url": direct,
-                "quality": "AUDIO_QUALITY_MEDIUM",
-                "container": f"audio/{ext}",
-                "has_audio": True,
-                "has_video": False,
-                "has_photo": False,
-                "bitrate": str(f.get("abr") or f.get("tbr") or ""),
-                "codecs": acodec
-            })
-
-    # Determine overall content type
-    content_type = "video" if any(item["type"] == "video" for item in media_list) else "photo"
+    if audio_format and audio_format.get("url") not in seen_urls:
+        a_url = audio_format.get("url")
+        seen_urls.add(a_url)
+        media_list.append({
+            "type": "audio",
+            "id": f"{info.get('id', '101')}audio",
+            "url": a_url,
+            "quality": "AUDIO_QUALITY_MEDIUM",
+            "container": f"audio/{audio_format.get('ext', 'mp4')}",
+            "has_audio": True,
+            "has_video": False,
+            "has_photo": False,
+            "bitrate": str(audio_format.get("abr") or audio_format.get("tbr") or "66702"),
+            "codecs": audio_format.get("acodec") or "mp4a.40.5"
+        })
 
     return {
         "success": True,
-        "type": content_type,
-        "username": info.get("uploader_id") or info.get("uploader") or "",
-        "profile_image_uri": info.get("uploader_url") or "",
-        "caption": info.get("description") or info.get("title") or "",
-        "media": media_list
+        "type": "video" if any(m["type"] == "video" for m in media_list) else "photo",
+        "username": username,
+        "profile_image_uri": profile_image_uri,
+        "caption": caption,
+        "media": media_list,
     }
