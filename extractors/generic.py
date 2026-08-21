@@ -21,14 +21,14 @@ def extract_media(url: str, platform: str):
         "extract_flat": False,
         "format": "bestvideo+bestaudio/best",
         "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "android"],
-            }
+            "youtube": {"player_client": ["web", "android"]},
+            "instagram": {"get_comments": False},
         },
     }
 
-    cookies_file = os.getenv("YOUTUBE_COOKIES_FILE")
-    if platform == "youtube" and cookies_file and os.path.isfile(cookies_file):
+    # Pass cookies for both YouTube and Instagram
+    cookies_file = os.getenv("COOKIES_FILE") or os.getenv("YOUTUBE_COOKIES_FILE")
+    if cookies_file and os.path.isfile(cookies_file):
         opts["cookiefile"] = cookies_file
 
     try:
@@ -36,58 +36,50 @@ def extract_media(url: str, platform: str):
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         error = str(exc)
-        if "Sign in to confirm" in error or "not a bot" in error:
+        if "Sign in to confirm" in error or "not a bot" in error or "login" in error.lower():
             raise RuntimeError(
-                "YouTube is blocking this server request. "
-                "Configure YOUTUBE_COOKIES_FILE with a valid cookies.txt file."
+                "Platform blocked this request. Configure COOKIES_FILE with valid cookies.txt."
             )
         raise RuntimeError(f"Media extraction failed: {error}")
 
-    # Fallbacks for username/channel name
+    # Username resolution with Instagram specific fallbacks
     username = (
         info.get("uploader_id")
         or info.get("uploader")
         or info.get("channel")
+        or info.get("user")
         or ""
     )
 
-    # Caption extraction
-    caption = info.get("description") or info.get("title") or ""
+    # If yt-dlp returns a raw numeric ID for Instagram, clear or sanitize it
+    if platform == "instagram" and username.isdigit():
+        username = info.get("uploader") or ""
 
-    # Profile Image fallback (yt-dlp rarely provides user avatars, uses thumbnail if unavailable)
-    profile_image_uri = info.get("uploader_avatar") or ""
+    caption = info.get("description") or info.get("title") or ""
+    profile_image_uri = info.get("uploader_avatar") or info.get("avatar") or ""
 
     media_list = []
     seen_urls = set()
 
-    # 1. Process Thumbnail as "photo"
-    thumbnail = info.get("thumbnail")
-    if thumbnail and thumbnail not in seen_urls:
-        seen_urls.add(thumbnail)
-        media_list.append({
-            "type": "photo",
-            "id": f"POLARIS_{info.get('id', '100')}",
-            "url": thumbnail,
-            "width": info.get("width") or 640,
-            "height": info.get("height") or 1136,
-            "has_audio": False,
-            "has_video": False,
-            "has_photo": True
-        })
+    # 1. Video extraction (Primary)
+    video_url = info.get("url")
+    formats = info.get("formats", [])
 
-    # 2. Extract best combined Video and Audio sources
-    best_video_url = info.get("url")
-    if best_video_url and best_video_url not in seen_urls:
-        seen_urls.add(best_video_url)
-        
+    # Find the best video format directly if info['url'] is missing or points to an image
+    if not video_url or ".jpg" in video_url or ".png" in video_url:
+        for f in reversed(formats):
+            if f.get("vcodec") != "none" and f.get("url"):
+                video_url = f.get("url")
+                break
+
+    if video_url and video_url not in seen_urls and ".jpg" not in video_url:
+        seen_urls.add(video_url)
         height = info.get("height")
-        quality_str = f"{height}p" if height else "1080p"
-
         media_list.append({
             "type": "video",
             "id": str(info.get("id", "101")),
-            "url": best_video_url,
-            "quality": quality_str,
+            "url": video_url,
+            "quality": f"{height}p" if height else "1080p",
             "container": f"video/{info.get('ext', 'mp4')}",
             "has_audio": True,
             "has_video": True,
@@ -95,37 +87,56 @@ def extract_media(url: str, platform: str):
             "width": info.get("width"),
             "height": info.get("height"),
             "fps": info.get("fps"),
-            "bitrate": info.get("tbr")
+            "bitrate": info.get("tbr"),
         })
 
-    # 3. Separate Audio item
-    requested_formats = info.get("requested_formats") or []
-    audio_format = None
+    # 2. Thumbnail / Photo extraction
+    thumbnail = info.get("thumbnail")
+    if thumbnail and thumbnail not in seen_urls:
+        seen_urls.add(thumbnail)
+        media_list.append({
+            "type": "photo",
+            "id": f"POLARIS_{info.get('id', '100')}",
+            "url": thumbnail,
+            "width": info.get("width") or 720,
+            "height": info.get("height") or 1280,
+            "has_audio": False,
+            "has_video": False,
+            "has_photo": True,
+        })
 
-    for f in requested_formats:
-        if f.get("vcodec") == "none" and f.get("acodec") != "none":
-            audio_format = f
+    # 3. Audio extraction
+    audio_url = None
+    audio_codec = "mp4a.40.5"
+    audio_bitrate = "64"
+
+    for f in formats:
+        if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url"):
+            audio_url = f.get("url")
+            audio_codec = f.get("acodec", audio_codec)
+            audio_bitrate = str(f.get("abr") or f.get("tbr") or "64")
             break
 
-    if audio_format and audio_format.get("url") not in seen_urls:
-        a_url = audio_format.get("url")
-        seen_urls.add(a_url)
+    if audio_url and audio_url not in seen_urls:
+        seen_urls.add(audio_url)
         media_list.append({
             "type": "audio",
             "id": f"{info.get('id', '101')}audio",
-            "url": a_url,
+            "url": audio_url,
             "quality": "AUDIO_QUALITY_MEDIUM",
-            "container": f"audio/{audio_format.get('ext', 'mp4')}",
+            "container": "audio/m4a",
             "has_audio": True,
             "has_video": False,
             "has_photo": False,
-            "bitrate": str(audio_format.get("abr") or audio_format.get("tbr") or "66702"),
-            "codecs": audio_format.get("acodec") or "mp4a.40.5"
+            "bitrate": audio_bitrate,
+            "codecs": audio_codec,
         })
+
+    has_video = any(item["type"] == "video" for item in media_list)
 
     return {
         "success": True,
-        "type": "video" if any(m["type"] == "video" for m in media_list) else "photo",
+        "type": "video" if has_video else "photo",
         "username": username,
         "profile_image_uri": profile_image_uri,
         "caption": caption,
