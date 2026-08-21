@@ -5,7 +5,6 @@ import urllib.parse
 import urllib.request
 import yt_dlp
 
-# Platform logos used when user avatar is blocked or unavailable
 PLATFORM_LOGOS = {
     "instagram": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e7/Instagram_logo_2016.svg/2048px-Instagram_logo_2016.svg.png",
     "facebook": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Facebook_Logo_%282019%29.png/1024px-Facebook_Logo_%282019%29.png",
@@ -16,7 +15,6 @@ PLATFORM_LOGOS = {
 }
 
 def get_instagram_profile_avatar(url: str):
-    """Fetches and cleans Instagram avatar link."""
     match = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)", url)
     if not match:
         return ""
@@ -24,7 +22,6 @@ def get_instagram_profile_avatar(url: str):
     shortcode = match.group(1)
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # Strategy 1: OEmbed API
     try:
         oembed_url = f"https://api.instagram.com/oembed/?url=https://www.instagram.com/p/{shortcode}/"
         req = urllib.request.Request(oembed_url, headers=headers)
@@ -35,7 +32,6 @@ def get_instagram_profile_avatar(url: str):
     except Exception:
         pass
 
-    # Strategy 2: Embed HTML regex parsing
     try:
         embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
         req = urllib.request.Request(embed_url, headers=headers)
@@ -60,7 +56,7 @@ def extract_media(url: str, platform: str):
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
-        "format": "bestvideo+bestaudio/best",
+        "format": "best",  # 'best' grabs pre-merged MP4 with integrated audio on Pinterest
         "extractor_args": {
             "youtube": {"player_client": ["web", "android"]},
             "instagram": {"get_comments": False},
@@ -68,7 +64,6 @@ def extract_media(url: str, platform: str):
         },
     }
 
-    # Checks environment variables OR looks directly for 'cookies.txt' in project folder
     cookies_file = (
         os.getenv("COOKIES_FILE") 
         or os.getenv("YOUTUBE_COOKIES_FILE") 
@@ -92,32 +87,42 @@ def extract_media(url: str, platform: str):
     profile_image_uri = info.get("uploader_avatar") or ""
     caption = info.get("description") or info.get("title") or ""
 
-    # Fetch avatar directly for Instagram
     if platform.lower() == "instagram":
         avatar = get_instagram_profile_avatar(url)
         if avatar:
             profile_image_uri = avatar
 
-    # Fix numeric username fallback
     if username.isdigit() and info.get("uploader"):
         username = info.get("uploader")
 
-    # Set platform logo if profile avatar is missing/empty
     if not profile_image_uri or profile_image_uri.strip() == "":
         profile_image_uri = PLATFORM_LOGOS.get(platform.lower(), "")
 
     media_list = []
     seen_urls = set()
-
-    # 1. Main Video Format
-    video_url = info.get("url")
     formats = info.get("formats", [])
 
-    if not video_url or ".jpg" in video_url or ".png" in video_url:
-        for f in reversed(formats):
-            if f.get("vcodec") != "none" and f.get("url"):
-                video_url = f.get("url")
-                break
+    # 1. PINTEREST & HLS FIX: Prioritize Direct Progressive MP4 (has audio built-in)
+    video_url = None
+    direct_mp4 = None
+
+    for f in reversed(formats):
+        f_url = f.get("url", "")
+        # Look for direct MP4 files first (bypasses .m3u8 audio issues)
+        if f.get("vcodec") != "none" and f.get("acodec") != "none" and ".mp4" in f_url:
+            direct_mp4 = f_url
+            break
+
+    # Fallback to general video format if direct MP4 isn't found
+    if direct_mp4:
+        video_url = direct_mp4
+    else:
+        video_url = info.get("url")
+        if not video_url or ".jpg" in video_url or ".png" in video_url:
+            for f in reversed(formats):
+                if f.get("vcodec") != "none" and f.get("url"):
+                    video_url = f.get("url")
+                    break
 
     if video_url and video_url not in seen_urls and ".jpg" not in video_url:
         seen_urls.add(video_url)
@@ -127,7 +132,7 @@ def extract_media(url: str, platform: str):
             "id": str(info.get("id", "101")),
             "url": video_url,
             "quality": f"{height}p" if height else "1080p",
-            "container": f"video/{info.get('ext', 'mp4')}",
+            "container": "video/mp4",
             "has_audio": True,
             "has_video": True,
             "has_photo": False,
@@ -152,12 +157,13 @@ def extract_media(url: str, platform: str):
             "has_photo": True,
         })
 
-    # 3. Audio Stream Extraction (Handles Facebook, Instagram & YouTube DASH)
+    # 3. Audio Extraction (Extracts Audio track explicitly)
+    audio_found = False
     for f in formats:
         a_url = f.get("url")
-        is_audio_only = (f.get("vcodec") == "none" or f.get("vcodec") is None) and f.get("acodec") not in (None, "none")
+        is_audio = (f.get("vcodec") == "none" or f.get("vcodec") is None) and f.get("acodec") not in (None, "none")
         
-        if is_audio_only and a_url and a_url not in seen_urls:
+        if is_audio and a_url and a_url not in seen_urls:
             seen_urls.add(a_url)
             media_list.append({
                 "type": "audio",
@@ -171,7 +177,23 @@ def extract_media(url: str, platform: str):
                 "bitrate": str(f.get("abr") or f.get("tbr") or "128"),
                 "codecs": f.get("acodec", "mp4a.40.2"),
             })
+            audio_found = True
             break
+
+    # If Pinterest doesn't provide a separate audio stream in formats, use the MP4 url as audio fallback
+    if not audio_found and video_url and ".m3u8" not in video_url:
+        media_list.append({
+            "type": "audio",
+            "id": f"{info.get('id', '101')}audio",
+            "url": video_url,
+            "quality": "AUDIO_QUALITY_MEDIUM",
+            "container": "audio/mp4",
+            "has_audio": True,
+            "has_video": False,
+            "has_photo": False,
+            "bitrate": "128",
+            "codecs": "mp4a.40.2",
+        })
 
     return {
         "success": True,
