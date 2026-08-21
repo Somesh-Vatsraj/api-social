@@ -5,81 +5,57 @@ import urllib.parse
 import urllib.request
 import yt_dlp
 
-SUPPORTED = {
-    "youtube": "YouTube",
-    "instagram": "Instagram",
-    "facebook": "Facebook",
-    "tiktok": "TikTok",
-    "threads": "Threads",
-    "pinterest": "Pinterest",
-    "moj": "Moj",
-}
 
-
-def get_instagram_profile_api(url: str):
+def resolve_instagram_identity(shortcode: str):
     """
-    Directly fetches exact handle (@username) and high-res profile picture 
-    using Instagram's public mobile endpoint (i.instagram.com).
+    GraphQL and Web Query Fallback Engine for Instagram.
+    Bypasses standard server blocks to extract exact @username & HD avatar.
     """
     username = ""
     profile_image = ""
 
-    # Extract shortcode from Instagram URL (e.g. /p/C123/ or /reel/C123/)
-    match = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)", url)
-    if not match:
-        return username, profile_image
+    # Strategy A: Instagram GraphQL Direct Query
+    # Shortcode to Media Hash / GraphQL variables
+    gql_url = f"https://www.instagram.com/graphql/query/?query_hash=b3055315a7b28016202db68012643a60&variables={urllib.parse.quote(json.dumps({'shortcode': shortcode}))}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "X-IG-App-ID": "936619743392459",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
-    shortcode = match.group(1)
-
-    # 1. Primary Method: Instagram Mobile API v1 (bypasses standard web blocks)
-    api_url = f"https://i.instagram.com/api/v1/media/shortcode/{shortcode}/"
     try:
-        req = urllib.request.Request(
-            api_url,
-            headers={
-                "User-Agent": "Instagram 275.0.0.27.98 Android (30/11; 480dpi; 1080x2260; Xiaomi; M2007J20CG; surya; qcom; en_US; 458223637)",
-                "X-IG-App-ID": "936619743392459",
-                "Accept-Language": "en-US",
-            },
-        )
+        req = urllib.request.Request(gql_url, headers=headers)
         with urllib.request.urlopen(req, timeout=5) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            user_data = data.get("items", [{}])[0].get("user", {})
+            res_data = json.loads(response.read().decode("utf-8"))
+            media_data = res_data.get("data", {}).get("shortcode_media", {})
+            owner = media_data.get("owner", {})
             
-            username = user_data.get("username", "")
-            profile_image = user_data.get("profile_pic_url", "")
+            username = owner.get("username", "")
+            profile_image = owner.get("profile_pic_url", "")
     except Exception:
         pass
 
-    # 2. Secondary Method: Public Embed Captioned Page Scraper
-    if not username or not profile_image:
+    # Strategy B: Embed Scraper Page Regex Parsing (If GraphQL rate-limited)
+    if not username or username.isdigit():
         embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
         try:
-            req = urllib.request.Request(
-                embed_url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"
-                    )
-                },
-            )
+            req = urllib.request.Request(embed_url, headers=headers)
             with urllib.request.urlopen(req, timeout=5) as response:
                 html = response.read().decode("utf-8")
 
-                if not username:
-                    user_match = re.search(r'class="UsernameText"[^>]*>([^<]+)</div>', html) or \
-                                 re.search(r'"username":"([^"]+)"', html)
-                    if user_match:
-                        username = user_match.group(1).strip()
+                # Match Username
+                u_match = re.search(r'"username":"([^"]+)"', html) or re.search(r'class="UsernameText"[^>]*>([^<]+)</div>', html)
+                if u_match:
+                    found_user = u_match.group(1).strip()
+                    if not found_user.isdigit():
+                        username = found_user
 
-                if not profile_image:
-                    avatar_match = re.search(r'class="Avatar"[^>]*src="([^"]+)"', html) or \
-                                   re.search(r'"profile_pic_url":"([^"]+)"', html) or \
-                                   re.search(r'class="Square--avatar"[^>]*src="([^"]+)"', html)
-                    if avatar_match:
-                        profile_image = avatar_match.group(1).replace("&amp;", "&").replace("\\/", "/")
+                # Match Profile Pic
+                p_match = re.search(r'"profile_pic_url":"([^"]+)"', html) or re.search(r'class="Avatar"[^>]*src="([^"]+)"', html)
+                if p_match:
+                    profile_image = p_match.group(1).replace("&amp;", "&").replace("\\/", "/")
         except Exception:
             pass
 
@@ -108,10 +84,7 @@ def extract_media(url: str, platform: str):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        error = str(exc)
-        if "Sign in to confirm" in error or "login" in error.lower():
-            raise RuntimeError("Platform blocked request. Configure COOKIES_FILE.")
-        raise RuntimeError(f"Media extraction failed: {error}")
+        raise RuntimeError(f"Media extraction failed: {str(exc)}")
 
     username = (
         info.get("uploader_id")
@@ -122,22 +95,27 @@ def extract_media(url: str, platform: str):
     profile_image_uri = info.get("uploader_avatar") or ""
     caption = info.get("description") or info.get("title") or ""
 
-    # Force direct Mobile API override for Instagram profiles
+    # --- Instagram Specific Identity Fix ---
     if platform == "instagram":
-        api_username, api_avatar = get_instagram_profile_api(url)
-        
-        if api_username:
-            username = api_username
-        elif username.isdigit() or " " in username:
-            username = info.get("uploader_id") or ""
+        # Extract shortcode from URL
+        match = re.search(r"instagram\.com/(?:p|reel|reels|tv)/([^/?#&]+)", url)
+        if match:
+            shortcode = match.group(1)
+            real_username, real_avatar = resolve_instagram_identity(shortcode)
+            
+            if real_username:
+                username = real_username
+            if real_avatar:
+                profile_image_uri = real_avatar
 
-        if api_avatar:
-            profile_image_uri = api_avatar
+    # If yt-dlp/API both fail to find avatar, clean up numeric username fallbacks
+    if username.isdigit():
+        username = info.get("uploader") or username
 
     media_list = []
     seen_urls = set()
 
-    # 1. Primary Video
+    # Video extraction logic
     video_url = info.get("url")
     formats = info.get("formats", [])
 
@@ -165,7 +143,7 @@ def extract_media(url: str, platform: str):
             "bitrate": info.get("tbr"),
         })
 
-    # 2. Cover Photo / Thumbnail
+    # Thumbnail / Cover Image
     thumbnail = info.get("thumbnail")
     if thumbnail and thumbnail not in seen_urls:
         seen_urls.add(thumbnail)
@@ -179,25 +157,6 @@ def extract_media(url: str, platform: str):
             "has_video": False,
             "has_photo": True,
         })
-
-    # 3. Audio Track
-    for f in formats:
-        a_url = f.get("url")
-        if f.get("vcodec") == "none" and f.get("acodec") != "none" and a_url and a_url not in seen_urls:
-            seen_urls.add(a_url)
-            media_list.append({
-                "type": "audio",
-                "id": f"{info.get('id', '101')}audio",
-                "url": a_url,
-                "quality": "AUDIO_QUALITY_MEDIUM",
-                "container": "audio/m4a",
-                "has_audio": True,
-                "has_video": False,
-                "has_photo": False,
-                "bitrate": str(f.get("abr") or f.get("tbr") or "64"),
-                "codecs": f.get("acodec", "mp4a.40.5"),
-            })
-            break
 
     return {
         "success": True,
